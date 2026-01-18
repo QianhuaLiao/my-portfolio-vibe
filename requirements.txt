@@ -2,4 +2,4 @@ streamlit
 pandas
 yfinance
 plotly
-google-genai
+google-generativeai
