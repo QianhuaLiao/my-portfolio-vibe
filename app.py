@@ -46,30 +46,26 @@ def save_targets(targets):
     with open(TARGETS_FILE, "w") as f:
         json.dump(targets, f)
 
-# --- OPTIMIZED TICKER LOGIC ---
-@st.cache_data(ttl=86400) # Cache for 24 hours to save API calls
+# --- TICKER RESOLUTION ---
+@st.cache_data(ttl=86400) 
 def resolve_ticker_logic(symbol, name):
-    # Step 1: Check if it's likely a German ISIN or Ticker
     for suffix in ["", ".DE"]:
         test_ticker = f"{symbol}{suffix}"
         try:
-            # fetch only 1 day to see if ticker exists quickly
             t = yf.Ticker(test_ticker)
-            if not t.history(period="1d").empty:
-                # Check history length only if ticker is valid
-                hist = t.history(period="5y")
-                if len(hist) > 800:
-                    return test_ticker
+            hist = t.history(period="2y")
+            if len(hist) > 250:
+                return test_ticker
         except:
             continue
     
-    # Step 2: AI Fallback (Gemini 3 Flash is significantly faster)
+    # AI Fallback to US Markets
     try:
         model = genai.GenerativeModel('gemini-3-flash-preview')
-        prompt = f"Act as a financial data expert. Find the primary US stock ticker (NYSE/NASDAQ) for '{name}'. Return ONLY the symbol, nothing else."
+        prompt = f"Return ONLY the primary US ticker symbol for '{name}'. No text, just the symbol."
         response = model.generate_content(prompt)
         fallback = response.text.strip().upper().replace("$", "")
-        if fallback and len(fallback) < 8:
+        if 0 < len(fallback) < 8:
             return fallback
     except:
         pass
@@ -80,13 +76,16 @@ def resolve_ticker_logic(symbol, name):
 def fetch_stock_data(ticker_symbol):
     try:
         ticker = yf.Ticker(ticker_symbol)
-        df = ticker.history(period="5y")
+        df = ticker.history(period="2y")
         if df.empty: return None
         
         current_price = df['Close'].iloc[-1]
+        
+        # SMAs Calculation
+        df['SMA51'] = df['Close'].rolling(window=51).mean()
+        df['SMA120'] = df['Close'].rolling(window=120).mean()
         df['SMA200'] = df['Close'].rolling(window=200).mean()
         df['SMA250'] = df['Close'].rolling(window=250).mean()
-        df['SMA850'] = df['Close'].rolling(window=850).mean()
         
         info = ticker.info
         pe = info.get("trailingPE") or info.get("forwardPE")
@@ -95,9 +94,10 @@ def fetch_stock_data(ticker_symbol):
             "df": df,
             "current_price": current_price,
             "pe": pe,
+            "sma51": df['SMA51'].iloc[-1],
+            "sma120": df['SMA120'].iloc[-1],
             "sma200": df['SMA200'].iloc[-1],
-            "sma250": df['SMA250'].iloc[-1],
-            "sma850": df['SMA850'].iloc[-1]
+            "sma250": df['SMA250'].iloc[-1]
         }
     except:
         return None
@@ -111,7 +111,6 @@ def main():
         targets = load_targets()
 
     if uploaded_file:
-        # Detect delimiter and load
         df_raw = pd.read_csv(uploaded_file, sep=None, engine='python')
         
         with st.sidebar.expander("Column Mapping"):
@@ -125,20 +124,17 @@ def main():
             if pd.isna(val): return 0.0
             if isinstance(val, str):
                 val = val.replace('\xa0', '').replace(' ', '')
-                if ',' in val and '.' in val: # e.g. 1.234,56
+                if ',' in val and '.' in val:
                     val = val.replace('.', '').replace(',', '.')
-                elif ',' in val: # e.g. 1234,56
+                elif ',' in val:
                     val = val.replace(',', '.')
             try: return float(val)
             except: return 0.0
 
         df_raw[col_shares] = df_raw[col_shares].apply(clean_num)
-        
-        # Aggregate holdings
         unique_assets = df_raw[col_symbol].dropna().unique()
         holdings_data = []
         
-        # Use a container for progress to keep UI clean
         progress_container = st.container()
         with progress_container:
             progress_bar = st.progress(0)
@@ -147,7 +143,7 @@ def main():
             for i, sym in enumerate(unique_assets):
                 asset_rows = df_raw[df_raw[col_symbol] == sym]
                 name = str(asset_rows[col_name].iloc[0])
-                status_text.text(f"Analyzing {name} ({i+1}/{len(unique_assets)})...")
+                status_text.text(f"Processing {name}...")
                 
                 qty = 0
                 for _, row in asset_rows.iterrows():
@@ -157,15 +153,16 @@ def main():
                     elif any(k in t_type for k in ["sell", "verkauf", "auslieferung"]): qty -= s
                 
                 if qty > 0.001:
-                    # Logic is slow because of multiple YF calls; results are cached for next run
                     resolved = resolve_ticker_logic(sym, name)
                     data = fetch_stock_data(resolved)
                     if data:
                         holdings_data.append({
                             "Symbol": sym, "Resolved": resolved, "Name": name, "Qty": qty,
                             "Price": data["current_price"], "Value": qty * data["current_price"],
-                            "P/E": data["pe"], "SMA200": data["sma200"], "SMA250": data["sma250"],
-                            "SMA850": data["sma850"], "df": data["df"]
+                            "P/E": data["pe"], 
+                            "SMA51": data["sma51"], "SMA120": data["sma120"],
+                            "SMA200": data["sma200"], "SMA250": data["sma250"], 
+                            "df": data["df"]
                         })
                 progress_bar.progress((i + 1) / len(unique_assets))
         
@@ -173,16 +170,20 @@ def main():
         progress_bar.empty()
 
         if not holdings_data:
-            st.error("No active holdings found in this CSV.")
+            st.error("No active holdings found.")
             return
 
         portfolio_df = pd.DataFrame(holdings_data)
         total_value = portfolio_df["Value"].sum()
         
-        # Global Alert
+        # Warnings
+        below_200 = portfolio_df[portfolio_df["Price"] < portfolio_df["SMA200"]]
         below_250 = portfolio_df[portfolio_df["Price"] < portfolio_df["SMA250"]]
+        
         if not below_250.empty:
             st.warning(f"⚠️ {len(below_250)} assets are trading below their 250-day average.")
+        elif not below_200.empty:
+            st.warning(f"⚠️ {len(below_200)} assets are trading below their 200-day average.")
 
         with st.sidebar:
             st.subheader("Target Allocation")
@@ -197,7 +198,8 @@ def main():
         c1, c2, c3 = st.columns(3)
         c1.metric("Total Value", f"€{total_value:,.2f}")
         c2.metric("Positions", len(portfolio_df))
-        c3.metric("Deep Value Opps", len(portfolio_df[portfolio_df["Price"] < portfolio_df["SMA850"]]))
+        avg_pe = portfolio_df["P/E"].dropna().mean()
+        c3.metric("Avg Portfolio P/E", f"{avg_pe:.1f}" if not pd.isna(avg_pe) else "N/A")
 
         # Table
         display_df = portfolio_df.copy()
@@ -205,9 +207,10 @@ def main():
         display_df["Target %"] = display_df["Symbol"].map(new_targets).fillna(0)
         
         def calc_status(row):
-            if row["Price"] < row["SMA850"]: return "🟢 Opportunity"
-            if row["Price"] < row["SMA200"]: return "🔴 Bearish"
-            return "✅ OK"
+            if row["Price"] < row["SMA250"]: return "🔴 Bearish (250)"
+            if row["Price"] < row["SMA200"]: return "🟠 Bearish (200)"
+            if row["Price"] < row["SMA120"]: return "🟡 Correction"
+            return "🟢 Bullish"
 
         def calc_action(row):
             t_pct = row["Target %"]
@@ -228,18 +231,23 @@ def main():
 
         # Chart
         st.divider()
-        choice = st.selectbox("View Historical Trends", portfolio_df["Name"])
+        choice = st.selectbox("View Historical Trends & SMAs", portfolio_df["Name"])
         chart_row = portfolio_df[portfolio_df["Name"] == choice].iloc[0]
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['Close'], name='Price', line=dict(color='#10b981')))
-        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['SMA200'], name='SMA 200', line=dict(color='#f43f5e', dash='dot')))
-        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['SMA850'], name='SMA 850', line=dict(color='#f59e0b')))
+        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['Close'], name='Price', line=dict(color='#ffffff', width=2)))
+        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['SMA51'], name='SMA 51', line=dict(color='#60a5fa', width=1)))
+        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['SMA120'], name='SMA 120', line=dict(color='#c084fc', width=1)))
+        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['SMA200'], name='SMA 200', line=dict(color='#f43f5e', width=1.5, dash='dot')))
+        fig.add_trace(go.Scatter(x=chart_row["df"].index, y=chart_row["df"]['SMA250'], name='SMA 250', line=dict(color='#fbbf24', width=1.5)))
         
-        fig.update_layout(template="plotly_dark", height=450, margin=dict(l=0,r=0,b=0,t=30), hovermode="x unified")
+        fig.update_layout(
+            title=f"{choice} Trend Analysis (51, 120, 200, 250 SMAs)",
+            template="plotly_dark", height=500, margin=dict(l=0,r=0,b=0,t=40), hovermode="x unified"
+        )
         st.plotly_chart(fig, use_container_width=True)
     else:
-        st.info("👋 Welcome! Please upload your Portfolio Performance CSV to begin.")
+        st.info("Upload your Portfolio Performance CSV to analyze your health.")
 
 if __name__ == "__main__":
     main()
