@@ -56,15 +56,15 @@ def resolve_ticker_logic(symbol, name):
         test_ticker = f"{symbol}{suffix}"
         try:
             t = yf.Ticker(test_ticker)
-            hist = t.history(period="1y")
-            if len(hist) > 20:
+            hist = t.history(period="1mo")
+            if not hist.empty:
                 return test_ticker
         except:
             continue
     
     try:
         model = genai.GenerativeModel('gemini-3-flash-preview')
-        prompt = f"Return ONLY the primary US ticker symbol for '{name}'. No text, just the symbol."
+        prompt = f"Return ONLY the primary US ticker symbol for '{name}'. No extra text."
         response = model.generate_content(prompt)
         fallback = response.text.strip().upper().replace("$", "")
         if 0 < len(fallback) < 10:
@@ -82,8 +82,6 @@ def fetch_stock_data(ticker_symbol):
         if df.empty: return None
         
         current_price = df['Close'].iloc[-1]
-        df['SMA51'] = df['Close'].rolling(window=51).mean()
-        df['SMA120'] = df['Close'].rolling(window=120).mean()
         df['SMA200'] = df['Close'].rolling(window=200).mean()
         df['SMA250'] = df['Close'].rolling(window=250).mean()
         
@@ -94,8 +92,6 @@ def fetch_stock_data(ticker_symbol):
             "df": df,
             "current_price": current_price,
             "pe": pe,
-            "sma51": df['SMA51'].iloc[-1],
-            "sma120": df['SMA120'].iloc[-1],
             "sma200": df['SMA200'].iloc[-1],
             "sma250": df['SMA250'].iloc[-1]
         }
@@ -111,8 +107,7 @@ def main():
         targets = load_targets()
 
     if uploaded_file:
-        # Step 1: Delimiter detection
-        content = uploaded_file.read().decode('utf-8-sig') # Handle potential BOM
+        content = uploaded_file.read().decode('utf-8-sig')
         delimiter = ';' if content.count(';') > content.count(',') else ','
         uploaded_file.seek(0)
         
@@ -134,102 +129,105 @@ def main():
         def clean_num(val):
             if pd.isna(val): return 0.0
             if isinstance(val, (int, float)): return float(val)
-            # String cleaning for German format: "1.234,56"
             s = str(val).strip().replace('\xa0', '').replace(' ', '')
             if not s: return 0.0
-            
-            # Logic: If both . and , exist, . is thousands. If only , exists, it's decimal.
             if ',' in s:
                 if '.' in s: s = s.replace('.', '')
                 s = s.replace(',', '.')
-            
             try: return float(s)
             except: return 0.0
 
         df_raw[col_shares] = df_raw[col_shares].apply(clean_num)
         
-        with st.expander("🔍 Mapping Debugger"):
-            debug_df = df_raw[[col_name, col_symbol, col_shares, col_type]].copy()
-            def debug_action(t_type):
-                t = str(t_type).lower()
-                if any(k in t for k in ["buy", "kauf", "einlieferung", "delivery", "inbound"]): return "BUY"
-                if any(k in t for k in ["sell", "verkauf", "auslieferung", "outbound"]): return "SELL"
-                return "IGNORE"
-            debug_df["Action"] = debug_df[col_type].apply(debug_action)
-            st.dataframe(debug_df, use_container_width=True)
+        # Robust Action Detection with stripping
+        def interpret_action(t_type):
+            t = str(t_type).strip().lower()
+            if any(k in t for k in ["buy", "kauf", "einlieferung", "delivery", "inbound"]): return 1
+            if any(k in t for k in ["sell", "verkauf", "auslieferung", "outbound"]): return -1
+            return 0
 
-        unique_assets = df_raw[col_symbol].dropna().unique()
-        holdings_data = []
+        df_raw['_multiplier'] = df_raw[col_type].apply(interpret_action)
+        df_raw['_net_shares'] = df_raw[col_shares] * df_raw['_multiplier']
+
+        # Summary for debugging
+        summary_calc = df_raw.groupby(col_symbol).agg({
+            col_name: 'first',
+            col_type: lambda x: list(set([str(i).strip() for i in x])), # Show raw types seen
+            col_shares: 'sum',
+            '_net_shares': 'sum'
+        }).reset_index()
+        summary_calc.columns = ['Symbol', 'Name', 'Raw Types in CSV', 'Total Shares (Abs)', 'Calculated Net Position']
+
+        with st.expander("🔍 Grouping & Net Position Debugger", expanded=True):
+            st.write("If 'Calculated Net Position' is 0, verify that 'Raw Types in CSV' are being recognized as Buys/Sells.")
+            st.dataframe(summary_calc, use_container_width=True)
+
+        holdings_to_process = summary_calc[summary_calc['Calculated Net Position'] > 0.001]
         
+        if holdings_to_process.empty:
+            st.error("❌ No active holdings found (Net Position ≤ 0).")
+            st.info("Check the 'Raw Types in CSV' column in the debugger above. Does it contain 'Buy' or 'Kauf'?")
+            return
+
+        holdings_data = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        for i, sym in enumerate(unique_assets):
-            asset_rows = df_raw[df_raw[col_symbol] == sym]
-            name = str(asset_rows[col_name].iloc[0])
-            status_text.text(f"Processing: {name}")
+        for i, (idx, row) in enumerate(holdings_to_process.iterrows()):
+            sym = row['Symbol']
+            name = row['Name']
+            qty = row['Calculated Net Position']
             
-            qty = 0
-            for _, row in asset_rows.iterrows():
-                t_type = str(row[col_type]).lower()
-                s = abs(row[col_shares])
-                is_buy = any(k in t_type for k in ["buy", "kauf", "einlieferung", "delivery", "inbound"])
-                is_sell = any(k in t_type for k in ["sell", "verkauf", "auslieferung", "outbound"])
-                if is_buy: qty += s
-                elif is_sell: qty -= s
-            
-            if qty > 0.001:
-                resolved = resolve_ticker_logic(sym, name)
-                if resolved:
-                    data = fetch_stock_data(resolved)
-                    if data:
-                        holdings_data.append({
-                            "Symbol": sym, "Resolved": resolved, "Name": name, "Qty": qty,
-                            "Price": data["current_price"], "Value": qty * data["current_price"],
-                            "SMA200": data["sma200"], "SMA250": data["sma250"], 
-                            "df": data["df"]
-                        })
-            progress_bar.progress((i + 1) / len(unique_assets))
+            status_text.text(f"Fetching: {name}")
+            resolved = resolve_ticker_logic(sym, name)
+            if resolved:
+                data = fetch_stock_data(resolved)
+                if data:
+                    holdings_data.append({
+                        "Symbol": sym, "Resolved": resolved, "Name": name, "Qty": qty,
+                        "Price": data["current_price"], "Value": qty * data["current_price"],
+                        "SMA200": data["sma200"], "SMA250": data["sma250"], 
+                        "df": data["df"]
+                    })
+            progress_bar.progress((i + 1) / len(holdings_to_process))
         
         status_text.empty()
         progress_bar.empty()
 
         if not holdings_data:
-            st.error("❌ No active holdings found. Check the 'Shares' values in the debugger above.")
+            st.error("❌ Could not fetch market data for the resolved symbols.")
             return
 
         portfolio_df = pd.DataFrame(holdings_data)
         total_value = portfolio_df["Value"].sum()
         
-        # UI Metrics
         m1, m2, m3 = st.columns(3)
-        m1.metric("Total Value", f"€{total_value:,.2f}")
-        m2.metric("Bullish", len(portfolio_df[portfolio_df["Price"] > portfolio_df["SMA200"]]))
-        m3.metric("Correction", len(portfolio_df[portfolio_df["Price"] < portfolio_df["SMA200"]]))
+        m1.metric("Portfolio Value", f"€{total_value:,.2f}")
+        m2.metric("Bullish (>200)", len(portfolio_df[portfolio_df["Price"] > portfolio_df["SMA200"]]))
+        m3.metric("Bearish (<200)", len(portfolio_df[portfolio_df["Price"] < portfolio_df["SMA200"]]))
 
-        # Main Table
         display_df = portfolio_df.copy()
         display_df["Weight %"] = (display_df["Value"] / total_value) * 100
-        display_df["Target %"] = display_df["Symbol"].map(new_targets := targets).fillna(0)
+        display_df["Target %"] = display_df["Symbol"].map(targets).fillna(0)
         
-        def calc_action(row):
-            t_pct = row["Target %"]
+        def calc_action(r):
+            t_pct = r["Target %"]
             if t_pct <= 0: return "-"
-            diff_val = ((t_pct / 100) * total_value) - row["Value"]
-            shares = diff_val / row["Price"]
+            diff = ((t_pct / 100) * total_value) - r["Value"]
+            shares = diff / r["Price"]
             return f"{'BUY' if shares > 0 else 'SELL'} {abs(shares):.1f}"
 
-        display_df["Action"] = display_df.apply(calc_action, axis=1)
-        st.dataframe(display_df[["Name", "Resolved", "Price", "Weight %", "Target %", "Action"]], use_container_width=True)
+        display_df["Action Needed"] = display_df.apply(calc_action, axis=1)
+        st.dataframe(display_df[["Name", "Resolved", "Price", "Weight %", "Target %", "Action Needed"]], use_container_width=True, hide_index=True)
 
-        st.subheader("Historical Analysis")
-        choice = st.selectbox("Select Asset", portfolio_df["Name"])
-        c_row = portfolio_df[portfolio_df["Name"] == choice].iloc[0]
+        st.subheader("Asset Chart")
+        asset_choice = st.selectbox("Select Asset", portfolio_df["Name"])
+        c_row = portfolio_df[portfolio_df["Name"] == asset_choice].iloc[0]
         
         fig = go.Figure()
-        fig.add_trace(go.Scatter(x=c_row["df"].index, y=c_row["df"]['Close'], name='Price', line=dict(color='white')))
-        fig.add_trace(go.Scatter(x=c_row["df"].index, y=c_row["df"]['SMA200'], name='SMA 200', line=dict(color='red', dash='dot')))
-        fig.update_layout(template="plotly_dark", height=400)
+        fig.add_trace(go.Scatter(x=c_row["df"].index, y=c_row["df"]['Close'], name='Price', line=dict(color='#60a5fa')))
+        fig.add_trace(go.Scatter(x=c_row["df"].index, y=c_row["df"]['SMA200'], name='SMA 200', line=dict(color='#f43f5e', dash='dot')))
+        fig.update_layout(template="plotly_dark", height=450)
         st.plotly_chart(fig, use_container_width=True)
 
 if __name__ == "__main__":
