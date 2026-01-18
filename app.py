@@ -6,13 +6,14 @@ import json
 import os
 import plotly.graph_objects as go
 from datetime import datetime, timedelta
-from @google/genai import GoogleGenAI
+from google import genai
 
 # --- CONFIGURATION ---
 st.set_page_config(page_title="Portfolio Health Dashboard", layout="wide", initial_sidebar_state="expanded")
 
-# Initialize Gemini for Ticker Resolution
-ai = GoogleGenAI(apiKey=os.environ.get("API_KEY"))
+# Initialize Gemini Client for Ticker Resolution
+# Note: In the Python SDK, we use the Client object.
+client = genai.Client(api_key=os.environ.get("API_KEY"))
 
 # --- STYLING ---
 st.markdown("""
@@ -28,8 +29,11 @@ TARGETS_FILE = "targets.json"
 
 def load_targets():
     if os.path.exists(TARGETS_FILE):
-        with open(TARGETS_FILE, "r") as f:
-            return json.load(f)
+        try:
+            with open(TARGETS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
     return {}
 
 def save_targets(targets):
@@ -47,26 +51,29 @@ def resolve_ticker_logic(symbol, name):
     # Attempt German Ticker first
     for suffix in ["", ".DE"]:
         test_ticker = f"{symbol}{suffix}"
-        t = yf.Ticker(test_ticker)
-        hist = t.history(period="1mo")
-        if not hist.empty:
-            # Check for 5-year history requirement (approx 1260 trading days)
-            long_hist = t.history(period="5y")
-            if len(long_hist) > 850:
-                return test_ticker
+        try:
+            t = yf.Ticker(test_ticker)
+            hist = t.history(period="1mo")
+            if not hist.empty:
+                # Check for 5-year history requirement (approx 1260 trading days)
+                long_hist = t.history(period="5y")
+                if len(long_hist) > 850:
+                    return test_ticker
+        except:
+            continue
     
     # Step 3: US Fallback Search via Gemini
     try:
         prompt = f"Find the primary US stock ticker (NYSE or NASDAQ) for the company '{name}'. Return ONLY the ticker symbol."
-        response = ai.models.generateContent(
-            model='gemini-3-pro-preview',
+        response = client.models.generate_content(
+            model='gemini-2.0-flash-exp', # Using a stable model version for Python SDK
             contents=prompt
         )
         fallback = response.text.strip()
         if fallback:
             return fallback
-    except:
-        pass
+    except Exception as e:
+        st.sidebar.error(f"AI Resolution Error: {e}")
     
     return f"{symbol}.DE" # Final default
 
@@ -126,7 +133,6 @@ def main():
         df_raw[col_shares] = pd.to_numeric(df_raw[col_shares].astype(str).str.replace(',', '.'), errors='coerce').fillna(0)
         
         # Calculate Quantities
-        holdings_summary = []
         unique_assets = df_raw[col_symbol].unique()
         
         progress_bar = st.progress(0)
@@ -144,9 +150,9 @@ def main():
             qty = 0
             for _, row in asset_rows.iterrows():
                 t_type = str(row[col_type]).lower()
-                if "buy" in t_type or "kauf" in t_type:
+                if any(k in t_type for k in ["buy", "kauf", "einlieferung"]):
                     qty += row[col_shares]
-                elif "sell" in t_type or "verkauf" in t_type:
+                elif any(k in t_type for k in ["sell", "verkauf", "auslieferung"]):
                     qty -= row[col_shares]
             
             if qty > 0.001:
