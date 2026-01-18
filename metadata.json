@@ -1,0 +1,5 @@
+{
+  "name": "Portfolio Health Dashboard (Python)",
+  "description": "Streamlit-based portfolio analyzer with yfinance and Gemini ticker resolution.",
+  "requestFramePermissions": []
+}
